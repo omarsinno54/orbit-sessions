@@ -13,7 +13,7 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build Orbit.app (universal)
         run: ./build.sh --no-install
@@ -24,7 +24,7 @@ jobs:
       - name: Zip
         run: ditto -c -k --keepParent build/Orbit.app Orbit.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Orbit
           path: Orbit.zip
