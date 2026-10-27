@@ -1,0 +1,36 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write   # needed to publish releases on version tags
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Orbit.app (universal)
+        run: ./build.sh --no-install
+
+      - name: Smoke test
+        run: build/Orbit.app/Contents/MacOS/Orbit --help
+
+      - name: Zip
+        run: ditto -c -k --keepParent build/Orbit.app Orbit.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Orbit
+          path: Orbit.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" Orbit.zip --title "Orbit $GITHUB_REF_NAME" --generate-notes
