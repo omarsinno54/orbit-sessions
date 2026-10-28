@@ -1,12 +1,13 @@
 # Orbit
 
-**Your Claude Code sessions, as a map.** Orbit is a small, free macOS app that puts you in the center and every running [Claude Code](https://docs.anthropic.com/en/docs/claude-code) session around you. Jump to any session's Terminal tab, rename it, see how long it's been running, close it, or resume one you closed earlier.
+**Your Claude Code sessions, as a map.** Orbit is a small, free macOS app that shows every running [Claude Code](https://docs.anthropic.com/en/docs/claude-code) session orbiting around you, or around centers you create, like "Backend" or "Personal". Jump to any session's Terminal tab, rename it, see how long it's been running, close it, or resume one you closed earlier.
 
-![Orbit showing six sessions around the user](docs/map.png)
+![Orbit showing three centers, each with its sessions orbiting it](docs/map.png)
 
 ## Features
 
-- **See everything at once.** Every running session (Terminal or VS Code) is a card connected to you. Animated lines show which ones are working right now.
+- **See everything at once.** Every running session (Terminal or VS Code) is a card connected to its center. Animated lines show which ones are working right now.
+- **Group sessions around centers.** Add as many centers as you like. Each has its own name and its own colored, nearly transparent circle, with its sessions orbiting inside. Drag a card onto another center to move it there.
 - **Open in Terminal.** Double-click a card to bring its Terminal tab to the front. Sessions running in VS Code are moved to Terminal: Orbit stops them there and resumes the same conversation in a new Terminal window.
 - **Details and renaming.** Click a card to see the session ID, folder, start time, how long it's been running, an estimate of time spent working, last activity, model and git branch. Rename it with the pencil; the new name also shows up in Claude Code's own `/resume` list.
 - **Close and resume.** Close a session from its details or right-click menu. Closed sessions stay in **Recently Closed** (clock button) so you can pick them back up.
@@ -15,6 +16,8 @@
 - **Everything stays on your Mac.** Orbit has no network access, accounts or telemetry. It only reads files Claude Code already keeps in `~/.claude`.
 
 ![Details panel for a session](docs/details.png)
+
+![Editing a center's name and color](docs/centers.png)
 
 ## Requirements
 
@@ -55,12 +58,17 @@ Use `./build.sh --no-install` to build into `build/Orbit.app` without installing
 | Rename it | Click the pencil in the details (leave it empty to go back to the automatic title) |
 | Close it | **Close…** in the details, or right-click the card |
 | Resume a closed session | Clock button in the toolbar → **Resume** |
-| Start a new session | ⌘N, the **+** button, or double-click your initials |
+| Start a new session | ⌘N or the **+** button (goes to your main center) |
+| Add a center | The **New Center** button in the toolbar |
+| Rename or recolor a center | Click the center |
+| Start a session in a center | Double-click the center, or **New Session Here…** in its editor |
+| Move a session to another center | Drag its card onto that center's circle, right-click → **Move to Center**, or use the **Center** menu in its details |
+| Delete a center | Its editor, or right-click it (its sessions go back to the main center) |
 | Refresh now | ⌘R (Orbit also refreshes every 2 seconds) |
 
 The first time Orbit opens something in Terminal, macOS asks whether Orbit may control Terminal. Click **Allow**. If you said no by accident, turn it back on in **System Settings → Privacy & Security → Automation**.
 
-**Your initials** come from your Mac account name. To change them:
+**Your main center** shows your initials, taken from your Mac account name. Click it to give it a name and color of your own, or change the initials with:
 
 ```sh
 defaults write io.github.omarsinno54.orbit initials XY
@@ -85,6 +93,7 @@ $ORBIT --help
 - **Open** finds the Terminal tab by its terminal device (tty) using AppleScript.
 - **Close** sends the session a normal quit signal (SIGTERM), and force-quits it only if it hasn't stopped after 8 seconds. Claude Code saves conversations as it goes, so closed sessions can be resumed.
 - **Move to Terminal** (for VS Code sessions) closes the session the same way, then runs `claude --resume <session-id>` in a new Terminal window, in the session's folder.
+- **Centers** and which session belongs to which are saved in Orbit's own preferences (`io.github.omarsinno54.orbit`), keyed by session ID, so a session returns to its center when you resume it.
 - **Rename** appends a `custom-title` record to the transcript and writes `custom-title.json` beside it. This is the same format Claude Code's `/rename` uses.
 
 ## Caveats

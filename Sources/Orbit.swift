@@ -22,6 +22,11 @@ enum Paths {
         p.hasPrefix(home) ? "~" + p.dropFirst(home.count) : p
     }
 
+    /// Same folder, however it was spelled (symlinks like /tmp → /private/tmp resolved).
+    static func canonical(_ p: String) -> String {
+        URL(fileURLWithPath: p).resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
     static func folderName(_ p: String) -> String {
         p == home ? "~" : (p as NSString).lastPathComponent
     }
@@ -467,10 +472,96 @@ enum Demo {
                             title: $0.0, lastActive: now.addingTimeInterval(-$0.2 * 3600)) }
     }
 
+    static let centers: [Center] = [
+        .main,
+        Center(id: "demo-backend", name: "Backend", color: RGB.presets[2]),
+        Center(id: "demo-web", name: "Web", color: RGB.presets[5]),
+    ]
+
+    static func assignments(for sessions: [LiveSession]) -> [String: String] {
+        var out: [String: String] = [:]
+        for s in sessions {
+            switch Paths.folderName(s.cwd) {
+            case "api-server", "jobs": out[s.sessionId] = "demo-backend"
+            case "storefront": out[s.sessionId] = "demo-web"
+            default: break
+            }
+        }
+        return out
+    }
+
     static func stats(for s: LiveSession) -> SessionStats {
         let hours = Date().timeIntervalSince(s.startedAt) / 3600
         return SessionStats(prompts: max(1, Int(hours * 3)), workingTime: hours * 3600 * 0.35,
                             firstAt: s.startedAt.addingTimeInterval(20), model: "claude-opus-5-5", branch: "main")
+    }
+}
+
+// MARK: - Centers (groups of sessions, each drawn as its own orbit)
+
+struct RGB: Codable, Equatable, Hashable {
+    var r: Double, g: Double, b: Double
+
+    init(r: Double, g: Double, b: Double) { (self.r, self.g, self.b) = (r, g, b) }
+
+    init(_ color: Color) {
+        let ns = NSColor(color).usingColorSpace(.sRGB) ?? .systemIndigo
+        (r, g, b) = (Double(ns.redComponent), Double(ns.greenComponent), Double(ns.blueComponent))
+    }
+
+    var color: Color { Color(red: r, green: g, blue: b) }
+    var darker: Color { Color(red: r * 0.55, green: g * 0.55, blue: b * 0.62) }
+
+    static let indigo = RGB(r: 0.42, g: 0.40, b: 0.95)
+    static let presets: [RGB] = [
+        indigo,
+        RGB(r: 0.20, g: 0.52, b: 0.98),   // blue
+        RGB(r: 0.16, g: 0.70, b: 0.72),   // teal
+        RGB(r: 0.24, g: 0.72, b: 0.40),   // green
+        RGB(r: 0.93, g: 0.72, b: 0.14),   // yellow
+        RGB(r: 0.98, g: 0.55, b: 0.20),   // orange
+        RGB(r: 0.93, g: 0.30, b: 0.32),   // red
+        RGB(r: 0.90, g: 0.36, b: 0.66),   // pink
+        RGB(r: 0.56, g: 0.58, b: 0.62),   // gray
+    ]
+}
+
+struct Center: Codable, Identifiable, Equatable {
+    static let mainId = "main"
+
+    var id: String
+    var name: String
+    var color: RGB
+
+    var isMain: Bool { id == Self.mainId }
+    var displayName: String {
+        let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return n.isEmpty ? (isMain ? Identity.initials : "Untitled") : n
+    }
+
+    static let main = Center(id: mainId, name: "", color: .indigo)
+}
+
+/// Saved in the app's preferences: the list of centers and which session belongs to which.
+enum GroupStore {
+    private static let centersKey = "centers.v1"
+    private static let assignmentsKey = "assignments.v1"
+
+    static func loadCenters() -> [Center] {
+        let saved = UserDefaults.standard.data(forKey: centersKey)
+            .flatMap { try? JSONDecoder().decode([Center].self, from: $0) } ?? []
+        return [saved.first(where: \.isMain) ?? .main] + saved.filter { !$0.isMain }
+    }
+
+    static func loadAssignments() -> [String: String] {
+        UserDefaults.standard.data(forKey: assignmentsKey)
+            .flatMap { try? JSONDecoder().decode([String: String].self, from: $0) } ?? [:]
+    }
+
+    static func save(_ centers: [Center], _ assignments: [String: String]) {
+        guard !Demo.isOn else { return }
+        UserDefaults.standard.set(try? JSONEncoder().encode(centers), forKey: centersKey)
+        UserDefaults.standard.set(try? JSONEncoder().encode(assignments), forKey: assignmentsKey)
     }
 }
 
@@ -481,6 +572,11 @@ final class Store: ObservableObject {
     @Published var live: [LiveSession] = []
     @Published var recent: [PastSession] = []
     @Published var loaded = false
+    @Published private(set) var centers: [Center] = GroupStore.loadCenters()
+    @Published private(set) var assignments: [String: String] = GroupStore.loadAssignments()
+
+    /// New sessions started from a center: the next session that appears in that folder joins it.
+    private var expected: [(folder: String, after: Date, center: String)] = []
 
     private let scanner = Scanner()
     private let queue = DispatchQueue(label: "orbit.scan", qos: .userInitiated)
@@ -493,6 +589,8 @@ final class Store: ObservableObject {
         if Demo.isOn {
             live = Demo.sessions()
             recent = Demo.recent()
+            centers = Demo.centers
+            assignments = Demo.assignments(for: live)
             loaded = true
             return
         }
@@ -521,6 +619,7 @@ final class Store: ObservableObject {
                 if self.live != live { self.live = live }
                 if let recent, self.recent != recent { self.recent = recent }
                 self.loaded = true
+                self.claimExpectedSessions()
             }
         }
     }
@@ -535,6 +634,74 @@ final class Store: ObservableObject {
     func refreshSoon() {
         for delay in [0.5, 1.5, 4.0, 8.0] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { self.refresh(includeRecent: true) }
+        }
+    }
+
+    // MARK: centers
+
+    func centerId(for s: LiveSession) -> String {
+        if let c = assignments[s.sessionId], centers.contains(where: { $0.id == c }) { return c }
+        return Center.mainId
+    }
+
+    func center(_ id: String) -> Center? { centers.first { $0.id == id } }
+
+    func assign(_ sessionIds: [String], to centerId: String) {
+        for id in sessionIds { assignments[id] = centerId == Center.mainId ? nil : centerId }
+        GroupStore.save(centers, assignments)
+    }
+
+    /// Adds a center with the next unused preset colour and returns its id.
+    @discardableResult
+    func addCenter() -> String {
+        let used = Set(centers.map(\.color))
+        let color = RGB.presets.first { !used.contains($0) } ?? RGB.presets[centers.count % RGB.presets.count]
+        let c = Center(id: UUID().uuidString, name: "New Center", color: color)
+        centers.append(c)
+        GroupStore.save(centers, assignments)
+        return c.id
+    }
+
+    func update(_ c: Center) {
+        guard let i = centers.firstIndex(where: { $0.id == c.id }), centers[i] != c else { return }
+        centers[i] = c
+        GroupStore.save(centers, assignments)
+    }
+
+    /// Removes a center; its sessions go back to the main one.
+    func deleteCenter(_ id: String) {
+        guard id != Center.mainId else { return }
+        centers.removeAll { $0.id == id }
+        assignments = assignments.filter { $0.value != id }
+        GroupStore.save(centers, assignments)
+    }
+
+    // MARK: starting sessions
+
+    func startSession(in folder: String, center: String?) {
+        Actions.newSession(in: folder)
+        if let center, center != Center.mainId {
+            expected.append((Paths.canonical(folder), Date(), center))
+        }
+        refreshSoon()
+    }
+
+    func startSessionPickingFolder(center: String?) {
+        if let folder = Actions.chooseFolder() { startSession(in: folder, center: center) }
+    }
+
+    private func claimExpectedSessions() {
+        expected.removeAll { Date().timeIntervalSince($0.after) > 180 }
+        guard !expected.isEmpty else { return }
+        for i in expected.indices.reversed() {
+            let e = expected[i]
+            if let s = live.first(where: { assignments[$0.sessionId] == nil
+                                             && $0.startedAt >= e.after.addingTimeInterval(-5)
+                                             && Paths.canonical($0.cwd) == e.folder }) {
+                assignments[s.sessionId] = e.center
+                expected.remove(at: i)
+                GroupStore.save(centers, assignments)
+            }
         }
     }
 }
@@ -600,7 +767,7 @@ enum Actions {
         runInTerminal(cd: dir, command: "claude")
     }
 
-    static func chooseFolderAndStart() {
+    static func chooseFolder() -> String? {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -608,7 +775,7 @@ enum Actions {
         panel.prompt = "Start Claude Here"
         panel.message = "Choose the folder for the new Claude session"
         panel.directoryURL = URL(fileURLWithPath: Paths.home)
-        if panel.runModal() == .OK, let url = panel.url { newSession(in: url.path) }
+        return panel.runModal() == .OK ? panel.url?.path : nil
     }
 
     static func reveal(_ path: String) {
@@ -775,56 +942,114 @@ enum TitleWriter {
 
 // MARK: - Map layout
 
-/// Places session cards on an ellipse around the center hub, spreading the ring out
-/// until no cards overlap, then shrinking everything to fit the window if needed.
+/// One center on the map, in view coordinates.
+struct PlacedGroup {
+    let center: Center
+    let sessions: [LiveSession]
+    let origin: CGPoint
+    let radius: CGFloat
+    let points: [CGPoint]
+}
+
+/// Each center gets its own ring of cards (spread until nothing overlaps) inside a circle.
+/// The circles are laid out in rows, choosing the row length that lets the map be drawn
+/// the largest, then everything is scaled down to fit the window if needed.
 struct MapLayout {
     static let card = CGSize(width: 214, height: 72)
     static let hub: CGFloat = 116
 
-    let center: CGPoint
-    let points: [CGPoint]
+    let groups: [PlacedGroup]
     let scale: CGFloat
 
-    init(count n: Int, in size: CGSize) {
-        center = CGPoint(x: size.width / 2, y: size.height / 2)
-        guard n > 0 else { points = []; scale = 1; return }
-
-        let pad: CGFloat = 28
-        let cw = Self.card.width, ch = Self.card.height
-        let rx = min(500, max(190, (size.width - cw) / 2 - pad))
-        let ry = min(330, max(140, (size.height - ch) / 2 - pad))
+    /// Card offsets around a hub and the radius of the circle around them (unscaled).
+    static func ring(_ n: Int) -> (offsets: [CGPoint], radius: CGFloat) {
+        guard n > 0 else { return ([], hub / 2 + 46) }
+        let cw = card.width, ch = card.height, gap: CGFloat = 14
         let angles = (0..<n).map { -CGFloat.pi / 2 + 2 * .pi * CGFloat($0) / CGFloat(n) }
-
-        func place(_ k: CGFloat) -> [CGPoint] {
-            angles.map { CGPoint(x: k * rx * cos($0), y: k * ry * sin($0)) }
-        }
+        func place(_ r: CGFloat) -> [CGPoint] { angles.map { CGPoint(x: r * cos($0), y: r * sin($0)) } }
         func crowded(_ p: [CGPoint]) -> Bool {
-            let gap: CGFloat = 14
             for i in p.indices {
-                if abs(p[i].x) < (cw + Self.hub) / 2 + gap, abs(p[i].y) < (ch + Self.hub) / 2 + gap { return true }
+                // Keep a visible stretch of line between the hub and every card.
+                if abs(p[i].x) < (cw + hub) / 2 + 48, abs(p[i].y) < (ch + hub) / 2 + 48 { return true }
                 for j in p.indices where j > i {
                     if abs(p[i].x - p[j].x) < cw + gap, abs(p[i].y - p[j].y) < ch + gap { return true }
                 }
             }
             return false
         }
+        var r = hub / 2 + ch / 2 + 48
+        var p = place(r)
+        while crowded(p), r < 4000 { r *= 1.05; p = place(r) }
+        let radius = p.map { hypot(abs($0.x) + cw / 2, abs($0.y) + ch / 2) }.max()! + 22
+        return (p, radius)
+    }
 
-        var k: CGFloat = 1
-        var p = place(k)
-        while crowded(p), k < 6 { k *= 1.06; p = place(k) }
+    init(groups input: [(Center, [LiveSession])], in size: CGSize) {
+        let rings = input.map { Self.ring($0.1.count) }
+        let diam = rings.map { $0.radius * 2 }
+        let gap: CGFloat = 36, pad: CGFloat = 20
+        let count = max(1, input.count)
 
-        let halfW = (p.map { abs($0.x) }.max() ?? 0) + cw / 2 + pad
-        let halfH = (p.map { abs($0.y) }.max() ?? 0) + ch / 2 + pad
-        let s = min(1, size.width / (2 * halfW), size.height / (2 * halfH))
+        func rowWidth(_ row: [Int]) -> CGFloat {
+            var w: CGFloat = gap * CGFloat(row.count - 1)
+            for i in row { w += diam[i] }
+            return w
+        }
+        func rowHeight(_ row: [Int]) -> CGFloat {
+            var h: CGFloat = 0
+            for i in row { h = max(h, diam[i]) }
+            return h
+        }
+        func split(_ cols: Int) -> [[Int]] {
+            stride(from: 0, to: input.count, by: cols).map { Array($0..<min($0 + cols, input.count)) }
+        }
+        func height(_ rows: [[Int]]) -> CGFloat {
+            var h: CGFloat = gap * CGFloat(max(0, rows.count - 1))
+            for r in rows { h += rowHeight(r) }
+            return h
+        }
+
+        var best: (scale: CGFloat, rows: [[Int]])?
+        for cols in 1...count {
+            let rows = split(cols)
+            let w = rows.map(rowWidth).max() ?? 1
+            let h = height(rows)
+            let s: CGFloat = min(1, (size.width - 2 * pad) / w, (size.height - 2 * pad) / h)
+            if best == nil || s > best!.scale + 0.001 { best = (s, rows) }
+        }
+        let s = max(0.2, best?.scale ?? 1)
+        let rows = best?.rows ?? []
+
+        // Unscaled positions, centred on the origin.
+        let rowWidths = rows.map(rowWidth)
+        let rowHeights = rows.map(rowHeight)
+        let totalH = height(rows)
+        var centers = [CGPoint](repeating: .zero, count: input.count)
+        var y = -totalH / 2
+        for (r, row) in rows.enumerated() {
+            var x = -rowWidths[r] / 2
+            for i in row {
+                centers[i] = CGPoint(x: x + diam[i] / 2, y: y + rowHeights[r] / 2)
+                x += diam[i] + gap
+            }
+            y += rowHeights[r] + gap
+        }
+
+        let mid = CGPoint(x: size.width / 2, y: size.height / 2)
         scale = s
-        let c = center
-        points = p.map { CGPoint(x: c.x + $0.x * s, y: c.y + $0.y * s) }
+        groups = input.indices.map { i in
+            let o = CGPoint(x: mid.x + centers[i].x * s, y: mid.y + centers[i].y * s)
+            return PlacedGroup(center: input[i].0, sessions: input[i].1, origin: o,
+                               radius: rings[i].radius * s,
+                               points: rings[i].offsets.map { CGPoint(x: o.x + $0.x * s, y: o.y + $0.y * s) })
+        }
     }
 }
 
 // MARK: - Map pieces
 
 struct Edge {
+    let from: CGPoint
     let to: CGPoint
     let color: Color
     let active: Bool
@@ -833,7 +1058,6 @@ struct Edge {
 }
 
 struct EdgesLayer: View {
-    let center: CGPoint
     let edges: [Edge]
 
     var body: some View {
@@ -843,7 +1067,7 @@ struct EdgesLayer: View {
                 let phase = CGFloat(t) * -22
                 for e in edges {
                     var path = Path()
-                    path.move(to: center)
+                    path.move(to: e.from)
                     path.addLine(to: e.to)
                     let opacity = e.dimmed ? 0.12 : (e.emphasized ? 1 : (e.active ? 0.85 : 0.4))
                     let width: CGFloat = e.emphasized ? 3 : 2
@@ -882,23 +1106,120 @@ struct DotGrid: View {
     }
 }
 
-struct HubNode: View {
-    let initials: String
+/// The nearly transparent circle behind a center and its sessions.
+struct GroupBackdrop: View {
+    let color: RGB
+    let radius: CGFloat
+    let targeted: Bool
 
     var body: some View {
+        Circle()
+            .fill(color.color.opacity(targeted ? 0.2 : 0.09))
+            .overlay(Circle().strokeBorder(color.color.opacity(targeted ? 0.9 : 0.35), lineWidth: targeted ? 2.5 : 1.5))
+            .frame(width: radius * 2, height: radius * 2)
+            .contentShape(Circle())
+    }
+}
+
+struct HubNode: View {
+    let center: Center
+
+    var body: some View {
+        let name = center.displayName
         ZStack {
-            Circle().fill(LinearGradient(
-                colors: [Color(red: 0.42, green: 0.40, blue: 0.95), Color(red: 0.22, green: 0.16, blue: 0.62)],
-                startPoint: .top, endPoint: .bottom))
+            Circle().fill(LinearGradient(colors: [center.color.color, center.color.darker],
+                                         startPoint: .top, endPoint: .bottom))
             Circle().strokeBorder(.white.opacity(0.25), lineWidth: 1)
-            Text(initials)
-                .font(.system(size: 40, weight: .bold, design: .rounded))
+            Text(name)
+                .font(.system(size: name.count <= 3 ? 40 : 21, weight: .bold, design: .rounded))
                 .foregroundStyle(.white)
-                .minimumScaleFactor(0.5)
+                .shadow(color: .black.opacity(0.25), radius: 2, y: 1)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .minimumScaleFactor(0.4)
                 .padding(16)
         }
         .frame(width: MapLayout.hub, height: MapLayout.hub)
         .shadow(color: .black.opacity(0.3), radius: 14, y: 5)
+    }
+}
+
+/// Rename / recolour / delete a center. Shown as a sheet so the system colour panel can stay open.
+struct CenterEditor: View {
+    @EnvironmentObject var store: Store
+    let centerId: String
+    let onDone: () -> Void
+    @FocusState private var nameFocused: Bool
+
+    var body: some View {
+        if let c = store.center(centerId) {
+            let count = store.live.filter { store.centerId(for: $0) == c.id }.count
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(spacing: 12) {
+                    HubNode(center: c).scaleEffect(0.42).frame(width: 50, height: 50)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(c.isMain ? "Main center" : "Center").font(.headline)
+                        Text("\(count) session\(count == 1 ? "" : "s") · drag cards onto a center to move them")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Name").font(.caption).foregroundStyle(.secondary)
+                    TextField(c.isMain ? Identity.initials : "Center name",
+                              text: Binding(get: { c.name }, set: { var n = c; n.name = $0; store.update(n) }))
+                        .textFieldStyle(.roundedBorder)
+                        .focused($nameFocused)
+                        .onSubmit(onDone)
+                    if c.isMain {
+                        Text("Leave empty to show your initials.").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Color").font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 9) {
+                        ForEach(RGB.presets, id: \.self) { p in
+                            Button { var n = c; n.color = p; store.update(n) } label: {
+                                Circle().fill(p.color)
+                                    .frame(width: 22, height: 22)
+                                    .overlay(Circle().strokeBorder(Color.primary, lineWidth: 2).padding(-4)
+                                                .opacity(p == c.color ? 1 : 0))
+                            }
+                            .buttonStyle(.plain)
+                            .help("Use this color")
+                        }
+                        Divider().frame(height: 20)
+                        ColorPicker("Custom", selection: Binding(get: { c.color.color },
+                                                                 set: { var n = c; n.color = RGB($0); store.update(n) }),
+                                    supportsOpacity: false)
+                            .labelsHidden()
+                            .help("Pick any color")
+                    }
+                    Text("The circle behind the center uses this color, nearly transparent.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Button("New Session Here…") {
+                        onDone()
+                        DispatchQueue.main.async { store.startSessionPickingFolder(center: c.id) }
+                    }
+                    if !c.isMain {
+                        Button("Delete Center", role: .destructive) {
+                            store.deleteCenter(c.id)
+                            onDone()
+                        }
+                        .help("Its sessions move back to the main center")
+                    }
+                    Spacer()
+                    Button("Done", action: onDone).keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(20)
+            .frame(width: 440)
+            .onAppear { if c.name == "New Center" { nameFocused = true } }
+        }
     }
 }
 
@@ -993,7 +1314,7 @@ struct SessionDetail: View {
                 Button("Close…", action: onClose)
                 Spacer()
                 Menu {
-                    Button("New Session in This Folder") { Actions.newSession(in: s.cwd) }
+                    Button("New Session in This Folder") { store.startSession(in: s.cwd, center: store.centerId(for: s)) }
                     if let b = s.bridgeId, let url = URL(string: "https://claude.ai/code/\(b)") {
                         Button("Open on claude.ai") { NSWorkspace.shared.open(url) }
                     }
@@ -1094,6 +1415,20 @@ struct SessionDetail: View {
                     Text(s.sessionId).font(.system(size: 11.5, design: .monospaced)).textSelection(.enabled).fixedSize()
                     copyButton(s.sessionId)
                 }
+            }
+            row("Center") {
+                Picker("Center", selection: Binding(get: { store.centerId(for: s) },
+                                                    set: { store.assign([s.sessionId], to: $0) })) {
+                    ForEach(store.centers) { c in
+                        Label { Text(c.displayName) } icon: {
+                            Image(systemName: "circle.fill").foregroundStyle(c.color.color)
+                        }
+                        .tag(c.id)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
             }
             row("Folder") {
                 HStack(spacing: 6) {
@@ -1213,7 +1548,7 @@ struct Legend: View {
             item(.green, "Working")
             item(.blue, "Running a command")
             item(.gray, "Idle")
-            Text("Click a session for details · double-click to open it in Terminal")
+            Text("Click a session for details · double-click to open it · drag it to another center")
                 .foregroundStyle(.tertiary)
         }
         .font(.caption)
@@ -1246,6 +1581,15 @@ enum PendingAction: Identifiable {
     }
 }
 
+struct CenterRef: Identifiable { let id: String }
+
+struct PlacedCard: Identifiable {
+    let s: LiveSession
+    let point: CGPoint
+    let group: PlacedGroup
+    var id: String { s.id }
+}
+
 struct MapView: View {
     @EnvironmentObject var store: Store
     @State private var query = ""
@@ -1253,7 +1597,8 @@ struct MapView: View {
     @State private var selected: String?
     @State private var pending: PendingAction?
     @State private var showRecent = false
-    private let initials = Identity.initials
+    @State private var editingCenter: CenterRef?
+    @State private var dropTarget: String?
 
     private func matches(_ fields: String?...) -> Bool {
         let q = query.trimmingCharacters(in: .whitespaces)
@@ -1261,6 +1606,12 @@ struct MapView: View {
     }
 
     private var recent: [PastSession] { store.recent.filter { matches($0.title, $0.cwd) } }
+
+    /// Changes whenever a session or center appears, disappears or moves (drives the animation).
+    private var layoutKey: String {
+        store.centers.map(\.id).joined(separator: ",") + "|" +
+        store.live.map { $0.id + ">" + store.centerId(for: $0) }.joined(separator: ",")
+    }
 
     /// Everything opens in Terminal: Terminal sessions are brought forward,
     /// sessions running elsewhere (VS Code, …) are moved over.
@@ -1275,40 +1626,77 @@ struct MapView: View {
         }
     }
 
+    private func newCenter(moving sessionIds: [String] = []) {
+        let id = store.addCenter()
+        if !sessionIds.isEmpty { store.assign(sessionIds, to: id) }
+        editingCenter = CenterRef(id: id)
+    }
+
+    private func dropTargeting(_ centerId: String) -> (Bool) -> Void {
+        { inside in
+            if inside { dropTarget = centerId } else if dropTarget == centerId { dropTarget = nil }
+        }
+    }
+
     var body: some View {
         GeometryReader { geo in
-            let sessions = store.live
+            let input = store.centers.map { c in (c, store.live.filter { store.centerId(for: $0) == c.id }) }
             // Keep the bottom strip free for the legend.
-            let layout = MapLayout(count: sessions.count,
+            let layout = MapLayout(groups: input,
                                    in: CGSize(width: geo.size.width, height: max(200, geo.size.height - 48)))
-            let edges = sessions.indices.map { i -> Edge in
-                let s = sessions[i]
-                let st = StatusStyle(s.status)
-                return Edge(to: layout.points[i], color: st.color, active: st.active,
-                            emphasized: hovered == s.id || selected == s.id,
-                            dimmed: !matches(s.title, s.cwd, s.hostName))
+            let cards = layout.groups.flatMap { g in zip(g.sessions, g.points).map { PlacedCard(s: $0, point: $1, group: g) } }
+            let edges = cards.map { c -> Edge in
+                let st = StatusStyle(c.s.status)
+                return Edge(from: c.group.origin, to: c.point, color: st.color, active: st.active,
+                            emphasized: hovered == c.s.id || selected == c.s.id,
+                            dimmed: !matches(c.s.title, c.s.cwd, c.s.hostName))
             }
 
             ZStack {
                 DotGrid()
-                EdgesLayer(center: layout.center, edges: edges)
 
-                HubNode(initials: initials)
-                    .scaleEffect(max(layout.scale, 0.7))
-                    .position(layout.center)
-                    .onTapGesture(count: 2) { Actions.chooseFolderAndStart() }
-                    .contextMenu { Button("New Session…") { Actions.chooseFolderAndStart() } }
-                    .help("\(NSFullUserName()) · \(sessions.count) running · double-click to start a new session")
-
-                if store.loaded && sessions.isEmpty {
-                    Text("No Claude sessions running.\nDouble-click \(initials) or press ⌘N to start one.")
-                        .multilineTextAlignment(.center)
-                        .foregroundStyle(.secondary)
-                        .position(x: layout.center.x, y: layout.center.y + MapLayout.hub / 2 + 40)
+                // Circles behind each center (also where cards can be dropped).
+                ForEach(layout.groups, id: \.center.id) { g in
+                    GroupBackdrop(color: g.center.color, radius: g.radius, targeted: dropTarget == g.center.id)
+                        .dropDestination(for: String.self, action: { ids, _ in
+                            store.assign(ids, to: g.center.id)
+                            return true
+                        }, isTargeted: dropTargeting(g.center.id))
+                        .position(g.origin)
                 }
 
-                ForEach(Array(sessions.enumerated()), id: \.element.id) { i, s in
-                    let point = layout.points[i]
+                EdgesLayer(edges: edges)
+
+                ForEach(layout.groups, id: \.center.id) { g in
+                    HubNode(center: g.center)
+                        .scaleEffect(layout.scale)
+                        .onTapGesture(count: 2) { store.startSessionPickingFolder(center: g.center.id) }
+                        .onTapGesture { editingCenter = CenterRef(id: g.center.id) }
+                        .contextMenu {
+                            Button("New Session Here…") { store.startSessionPickingFolder(center: g.center.id) }
+                            Button("Edit Center…") { editingCenter = CenterRef(id: g.center.id) }
+                            if !g.center.isMain {
+                                Divider()
+                                Button("Delete Center") { store.deleteCenter(g.center.id) }
+                            }
+                        }
+                        .help("\(g.center.displayName) · \(g.sessions.count) running · click to rename or recolor, double-click to start a session here")
+                        .dropDestination(for: String.self, action: { ids, _ in
+                            store.assign(ids, to: g.center.id)
+                            return true
+                        }, isTargeted: dropTargeting(g.center.id))
+                        .position(g.origin)
+                }
+
+                if store.loaded && store.live.isEmpty, let main = layout.groups.first {
+                    Text("No Claude sessions running.\nDouble-click a center or press ⌘N to start one.")
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
+                        .position(x: main.origin.x, y: main.origin.y + main.radius + 30)
+                }
+
+                ForEach(cards) { card in
+                    let s = card.s
                     let emphasized = hovered == s.id || selected == s.id
                     SessionNode(s: s, emphasized: emphasized)
                         .scaleEffect(layout.scale * (hovered == s.id ? 1.04 : 1))
@@ -1320,7 +1708,7 @@ struct MapView: View {
                         .onTapGesture { selected = s.id }
                         .popover(isPresented: Binding(get: { selected == s.id },
                                                       set: { if !$0, selected == s.id { selected = nil } }),
-                                 arrowEdge: point.y < layout.center.y ? .bottom : .top) {
+                                 arrowEdge: card.point.y < card.group.origin.y ? .bottom : .top) {
                             SessionDetail(s: s, onOpen: { open(s) }, onClose: {
                                 selected = nil
                                 pending = .close(s)
@@ -1331,15 +1719,40 @@ struct MapView: View {
                             Button(s.inTerminal ? "Open in Terminal" : "Move to Terminal") { open(s) }
                             Button("Close…") { pending = .close(s) }
                             Divider()
-                            Button("New Session in This Folder") { Actions.newSession(in: s.cwd) }
+                            Menu("Move to Center") {
+                                ForEach(store.centers) { c in
+                                    Button {
+                                        store.assign([s.sessionId], to: c.id)
+                                    } label: {
+                                        if store.centerId(for: s) == c.id {
+                                            Label(c.displayName, systemImage: "checkmark")
+                                        } else {
+                                            Text(c.displayName)
+                                        }
+                                    }
+                                }
+                                Divider()
+                                Button("New Center…") { newCenter(moving: [s.sessionId]) }
+                            }
+                            Divider()
+                            Button("New Session in This Folder") {
+                                store.startSession(in: s.cwd, center: store.centerId(for: s))
+                            }
                             Button("Show Folder in Finder") { Actions.reveal(s.cwd) }
                             Divider()
                             Button("Copy Session ID") { Actions.copy(s.sessionId) }
                         }
-                        .position(point)
+                        .draggable(s.sessionId) {
+                            SessionNode(s: s, emphasized: true).opacity(0.85)
+                        }
+                        .dropDestination(for: String.self, action: { ids, _ in
+                            store.assign(ids, to: card.group.center.id)
+                            return true
+                        }, isTargeted: dropTargeting(card.group.center.id))
+                        .position(card.point)
                 }
             }
-            .animation(.spring(duration: 0.45), value: sessions.map(\.id))
+            .animation(.spring(duration: 0.45), value: layoutKey)
             .animation(.easeOut(duration: 0.15), value: hovered)
         }
         .overlay(alignment: .bottom) { Legend().padding(.bottom, 12) }
@@ -1349,14 +1762,20 @@ struct MapView: View {
         .navigationSubtitle(store.live.isEmpty ? "" : "\(store.live.count) running")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button { Actions.chooseFolderAndStart() } label: { Label("New Session", systemImage: "plus") }
+                Button { store.startSessionPickingFolder(center: nil) } label: { Label("New Session", systemImage: "plus") }
                     .help("Start a new Claude session in a folder (⌘N)")
+                Button { newCenter() } label: { Label("New Center", systemImage: "circle.badge.plus") }
+                    .help("Add a center to group sessions around")
                 Button { showRecent.toggle() } label: { Label("Recently Closed", systemImage: "clock.arrow.circlepath") }
                     .help("Recently closed sessions you can resume")
                     .popover(isPresented: $showRecent, arrowEdge: .bottom) { RecentPanel(items: recent) }
                 Button { store.refresh(includeRecent: true) } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                     .help("Refresh now (⌘R)")
             }
+        }
+        .sheet(item: $editingCenter) { ref in
+            CenterEditor(centerId: ref.id, onDone: { editingCenter = nil })
+                .environmentObject(store)
         }
         .alert(pending.map(alertTitle) ?? "",
                isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } }),
@@ -1383,6 +1802,11 @@ struct MapView: View {
             if UserDefaults.standard.bool(forKey: "debugSelectFirst") {
                 try? await Task.sleep(for: .seconds(1.5))
                 selected = store.live.first?.id
+            }
+            // `-debugEditCenter <id>` opens a center's editor (for screenshots).
+            if let id = UserDefaults.standard.string(forKey: "debugEditCenter") {
+                try? await Task.sleep(for: .seconds(1.5))
+                editingCenter = CenterRef(id: id)
             }
         }
     }
@@ -1425,7 +1849,7 @@ struct OrbitApp: App {
         .defaultSize(width: 1120, height: 800)
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button("New Session…") { Actions.chooseFolderAndStart() }.keyboardShortcut("n")
+                Button("New Session…") { store.startSessionPickingFolder(center: nil) }.keyboardShortcut("n")
                 Button("Refresh") { store.refresh(includeRecent: true) }.keyboardShortcut("r")
             }
         }
